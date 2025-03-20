@@ -1,10 +1,8 @@
 use anyhow::{Context, Result};
 use clap::Parser;
-use csv::{Reader, Writer};
 use dotenv::dotenv;
 use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 use std::cmp::min;
 use std::env;
 use std::fs::File;
@@ -28,7 +26,7 @@ struct Args {
 }
 
 // Structure for CSV input rows
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 struct KeywordRow {
     #[serde(rename = "Keyword")]
     keyword: String,
@@ -36,7 +34,6 @@ struct KeywordRow {
     #[serde(rename = "Search Volume")]
     #[serde(default)]
     search_volume: Option<i32>,
-    // Add any other columns from your CSV here
 }
 
 // Keywords Everywhere API response structure
@@ -89,33 +86,48 @@ fn main() -> Result<()> {
     let file = File::open(&args.input)
         .with_context(|| format!("Failed to open input file: {}", args.input.display()))?;
     
-    let mut rdr = Reader::from_reader(file);
-    let mut keywords_data: Vec<KeywordRow> = Vec::new();
+    let mut rdr = csv::ReaderBuilder::new()
+        .has_headers(true)
+        .from_reader(file);
     
-    // Collect all rows from the CSV
-    for result in rdr.deserialize() {
-        let record: KeywordRow = result.context("Failed to read CSV row")?;
-        keywords_data.push(record);
+    // Get headers to find keyword and search volume positions
+    let headers = rdr.headers().context("Failed to read CSV headers")?;
+    let keyword_index = headers.iter().position(|h| h == "Keyword")
+        .context("CSV must have a 'Keyword' column")?;
+    
+    // Search Volume column might not exist yet
+    let search_volume_index = headers.iter().position(|h| h == "Search Volume");
+    
+    // Clone headers to avoid borrow checker issues
+    let headers = headers.clone();
+    
+    // Store records and parsed keywords
+    let mut records: Vec<csv::StringRecord> = Vec::new();
+    let mut keywords: Vec<String> = Vec::new();
+    
+    // Read all records
+    for result in rdr.records() {
+        let record = result.context("Failed to read CSV row")?;
+        keywords.push(record[keyword_index].to_string());
+        records.push(record);
     }
     
     // Create HTTP client
     let client = Client::new();
     let endpoint = "https://api.keywordseverywhere.com/v1/get_keyword_data";
     
-    println!("Fetching search volume data for {} keywords...", keywords_data.len());
+    println!("Fetching search volume data for {} keywords...", keywords.len());
     
     // Process keywords in batches (API limit is 100 keywords per request)
     let batch_size = 100;
-    let total_batches = (keywords_data.len() + batch_size - 1) / batch_size;
+    let total_batches = (keywords.len() + batch_size - 1) / batch_size;
     
-    for (batch_index, chunk) in keywords_data.chunks_mut(batch_size).enumerate() {
+    // Store the API results
+    let mut volumes: std::collections::HashMap<String, Option<i32>> = std::collections::HashMap::new();
+    
+    for (batch_index, keyword_chunk) in keywords.chunks(batch_size).enumerate() {
         println!("Processing batch {}/{}", batch_index + 1, total_batches);
         
-        // Extract keywords for this batch
-        let batch_keywords: Vec<String> = chunk.iter()
-            .map(|row| row.keyword.clone())
-            .collect();
-            
         // Create API request
         let mut form = std::collections::HashMap::new();
         form.insert("country", "us");
@@ -124,7 +136,7 @@ fn main() -> Result<()> {
         
         // Add each keyword as a separate kw[] parameter
         let mut params = Vec::new();
-        for keyword in &batch_keywords {
+        for keyword in keyword_chunk {
             params.push(("kw[]", keyword));
         }
         
@@ -157,15 +169,12 @@ fn main() -> Result<()> {
         
         // Update search volume for each keyword in the batch
         for kw_data in api_data.data {
-            // Find the corresponding row in our data
-            if let Some(row) = chunk.iter_mut().find(|r| r.keyword == kw_data.keyword) {
-                row.search_volume = kw_data.vol;
-                
-                // Print volume info if verbose mode is enabled
-                if args.verbose {
-                    let volume = kw_data.vol.map_or("N/A".to_string(), |v| v.to_string());
-                    println!("Keyword: {:40} | Search Volume: {}", kw_data.keyword, volume);
-                }
+            volumes.insert(kw_data.keyword.clone(), kw_data.vol);
+            
+            // Print volume info if verbose mode is enabled
+            if args.verbose {
+                let volume = kw_data.vol.map_or("N/A".to_string(), |v| v.to_string());
+                println!("Keyword: {:40} | Search Volume: {}", kw_data.keyword, volume);
             }
         }
     }
@@ -177,9 +186,9 @@ fn main() -> Result<()> {
         println!("{:40} | {}", "Keyword", "Search Volume");
         println!("{:-^80}", "");
         
-        for row in &keywords_data {
-            let volume = row.search_volume.map_or("N/A".to_string(), |v| v.to_string());
-            println!("{:40} | {}", row.keyword, volume);
+        for (keyword, volume) in &volumes {
+            let volume_str = volume.map_or("N/A".to_string(), |v| v.to_string());
+            println!("{:40} | {}", keyword, volume_str);
         }
         println!("{:-^80}", "");
     }
@@ -191,10 +200,49 @@ fn main() -> Result<()> {
     let output_file = File::create(&output_path)
         .with_context(|| format!("Failed to create output file: {}", output_path.display()))?;
     
-    let mut wtr = Writer::from_writer(output_file);
+    // Create a CSV writer
+    let mut wtr = csv::WriterBuilder::new()
+        .from_writer(output_file);
     
-    for row in keywords_data {
-        wtr.serialize(row).context("Failed to write row to CSV")?;
+    // Create a new headers row with "Search Volume" if it doesn't exist
+    let mut new_headers = headers.clone();
+    if search_volume_index.is_none() {
+        new_headers.push_field("Search Volume");
+    }
+    
+    // Write the headers
+    wtr.write_record(&new_headers)?;
+    
+    // Write all records with updated search volume
+    for record in records {
+        let keyword = &record[keyword_index];
+        
+        if let Some(sv_index) = search_volume_index {
+            // If Search Volume column already exists, update it
+            let mut new_record = record.clone();
+            if let Some(volume) = volumes.get(keyword) {
+                if let Some(vol) = volume {
+                    // Create a completely new record as StringRecord doesn't have a get_mut method
+                    let mut fields: Vec<String> = new_record.iter().map(|s| s.to_string()).collect();
+                    fields[sv_index] = vol.to_string();
+                    new_record = csv::StringRecord::from(fields);
+                }
+            }
+            wtr.write_record(&new_record)?;
+        } else {
+            // If Search Volume column doesn't exist, add it
+            let mut new_record = record.clone();
+            if let Some(volume) = volumes.get(keyword) {
+                if let Some(vol) = volume {
+                    new_record.push_field(&vol.to_string());
+                } else {
+                    new_record.push_field("");
+                }
+            } else {
+                new_record.push_field("");
+            }
+            wtr.write_record(&new_record)?;
+        }
     }
     
     wtr.flush().context("Failed to flush CSV writer")?;
